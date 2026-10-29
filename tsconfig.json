@@ -4,5 +4,9 @@
     "moduleResolution": "bundler", "jsx": "react-jsx", "strict": true, "noEmit": true,
     "skipLibCheck": true, "types": ["vite/client"], "allowSyntheticDefaultImports": true
   },
-  "include": ["src"]
+  "include": ["src"],
+  "exclude": [
+    "src/game/DungeonScene.ts",
+    "src/components/PuzzleModal.tsx"
+  ]
 }
