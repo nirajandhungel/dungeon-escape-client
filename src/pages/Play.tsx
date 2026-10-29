@@ -37,6 +37,7 @@ import { api, type GameDto } from '../api';
 import { TypedEmitter, type GameEvents } from '../events';
 import { DungeonScene, MAPS, TILE } from '../game/DungeonScene';
 import PuzzleModal from '../components/PuzzleModal';
+import { useAuth } from '../auth';
 
 type Result = GameDto & { durationMs: number };
 const MAX_HP = 3;
@@ -45,6 +46,7 @@ const LEVELS = MAPS.length; // 3
 const fmtTime = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 
 export default function Play() {
+  const { serverStatus, retryServer } = useAuth();
   const navigate = useNavigate();
   const host = useRef<HTMLDivElement>(null);
   const [game, setGame] = useState<GameDto | null>(null);
@@ -61,16 +63,23 @@ export default function Play() {
   const [error, setError] = useState('');
   const [seconds, setSeconds] = useState(0);
   const [phaserRef, setPhaserRef] = useState<Phaser.Game | null>(null);
+  const [startingGame, setStartingGame] = useState(false);
   const [animateHeart, setAnimateHeart] = useState(false);
   const [doorLvl, setDoorLvl] = useState(false); // door unlocked on this level
   const gameIdRef = useRef<string | null>(null);
 
   // ── Bootstrap: create a new server-side game session ────────────────────
-  useEffect(() => {
+  // Retryable — if server is offline we show a retry button instead of a broken screen.
+  const startNewGame = useCallback(() => {
+    setStartingGame(true);
+    setError('');
     api.newGame()
       .then((g) => { setGame(g); gameIdRef.current = g.id; })
-      .catch(() => setError('Could not connect to the game server. Is the server running?'));
+      .catch(() => setError('Could not reach the game server. Check it is running on port 4000.'))
+      .finally(() => setStartingGame(false));
   }, []);
+
+  useEffect(() => { startNewGame(); }, [startNewGame]);
 
   // ── Mount Phaser when game session is ready ──────────────────────────────
   useEffect(() => {
@@ -185,10 +194,8 @@ export default function Play() {
     setHp(MAX_HP); setPaused(false); setPuzzleOpen(false);
     setResult(null); setDead(false); setError(''); setSeconds(0);
     setHint('Find the golden key.'); setLevel(0); setDoorLvl(false);
-    api.newGame()
-      .then((g) => { setGame(g); gameIdRef.current = g.id; })
-      .catch(() => setError('Could not start a new game.'));
-  }, [phaserRef]);
+    startNewGame();
+  }, [phaserRef, startNewGame]);
 
   const hearts = Array.from({ length: MAX_HP }, (_, i) => ({
     full: i < hp,
@@ -249,8 +256,33 @@ export default function Play() {
         <span><span className="key-icon">Esc</span> — Pause</span>
       </div>
 
-      {/* ── Error ────────────────────────────────────────────────────── */}
-      {error && <p className="msg bad" role="alert">{error}</p>}
+      {/* ── Server offline mid-game warning ────────────────────────────── */}
+      {serverStatus === 'offline' && game && (
+        <div role="alert" style={{
+          position: 'fixed', bottom: '1rem', right: '1rem', zIndex: 500,
+          background: 'rgba(127,29,29,.9)', color: '#fef2f2',
+          borderRadius: '10px', padding: '.6rem 1rem',
+          fontSize: '.8rem', display: 'flex', gap: '.75rem', alignItems: 'center',
+          boxShadow: '0 4px 16px rgba(0,0,0,.5)', backdropFilter: 'blur(6px)',
+        }}>
+          <span>⚠️ Server offline — score may not save</span>
+          <button onClick={retryServer} style={{ background: 'rgba(255,255,255,.2)', border: 'none', color: '#fef2f2', borderRadius: '5px', padding: '.2rem .5rem', cursor: 'pointer', fontSize: '.75rem' }}>Retry</button>
+        </div>
+      )}
+
+      {/* ── Error with retry ──────────────────────────────────────────── */}
+      {error && (
+        <div style={{ textAlign: 'center', padding: '3rem 1rem' }}>
+          <div style={{ fontSize: '3rem', marginBottom: '1rem' }}>🔌</div>
+          <p className="msg bad" role="alert" style={{ marginBottom: '1.5rem' }}>{error}</p>
+          <div style={{ display: 'flex', gap: '1rem', justifyContent: 'center' }}>
+            <button id="play-retry-btn" onClick={startNewGame} disabled={startingGame}>
+              {startingGame ? 'Connecting…' : '↻ Retry'}
+            </button>
+            <Link className="btn ghost" to="/">Home</Link>
+          </div>
+        </div>
+      )}
 
       {/* ── Pause overlay ─────────────────────────────────────────────── */}
       {paused && (
