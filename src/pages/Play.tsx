@@ -1,345 +1,397 @@
 /**
- * Play.tsx — Main game page
+ * Play.tsx — the game screen and the main EVENT CONSUMER.
  *
- * EVENT-DRIVEN ARCHITECTURE:
- * This component is the primary EVENT CONSUMER. It subscribes to the GameBus
- * and updates React state in response to game events emitted by DungeonScene.
+ *   keyboard / touch ──▶ InputController ──▶ GameEngine (rules) ──▶ typed events on the bus
+ *                                                                        │
+ *      ┌─────────────────────────────────────────────────────────────────┘
+ *      ▼
+ *   Play.tsx (this file)  ── updates HUD state, calls the server at the right moments:
+ *        key:collected(i) → POST /games/:id/key {index}    (key i, for door i, is saved)
+ *        door:touched(i)  → opens <BananaChallengeModal>   (which calls the Banana-backed endpoints)
+ *        puzzle:solved    → engine.unlockDoor()            (only after the SERVER said correct)
+ *        level:cleared    → POST /games/:id/advance        (next chapter; a relic is recovered)
+ *        game:won         → POST /games/:id/complete       (server scores the run and awards rank, achievements, capes)
+ *   audio.ts also subscribes to the same bus (sound effects) without Play knowing about it.
  *
- * Event handlers registered here:
- *   key:collected   → setHasKey(true), call api.collectKey() to persist
- *   player:damaged  → update hp state, trigger heart animation
- *   door:locked     → update hint message
- *   door:touched    → open PuzzleModal
- *   door:unlocked   → close PuzzleModal, update hint
- *   game:paused     → show pause overlay
- *   game:resumed    → hide pause overlay
- *   game:won        → call api.complete(), show victory screen
- *   game:dead       → show death screen
+ * A run is a campaign of chapters; each chapter is a chain of rooms, and EVERY door has its own key and its own Banana
+ * challenge. The dungeon for chapter N is generated from the run's server-issued seed, so a resume rebuilds the same rooms.
  *
- * MEMORY MANAGEMENT:
- * All bus subscriptions are stored in the `off` array and called on cleanup.
- * The Phaser game is destroyed on cleanup, preventing canvas/WebGL leaks.
- * The interval timer (seconds) is cleared on cleanup.
- *
- * INTEROPERABILITY FLOW:
- * Player action (Phaser) → bus event → React state → PuzzleModal
- *   → api.requestPuzzle() → Express /games/:id/puzzles
- *   → BananaClient.fetchPuzzle() → https://marcconrad.com/uob/banana/api.php
- *   → puzzle stored in MongoDB → PuzzleDto returned to client
- *   → player submits answer → api.verify() → Express /puzzles/:id/verify
- *   → answer compared server-side → { correct: true } → bus.emit('puzzle:solved')
- *   → scene.unlockDoor() → door destroyed → exit reachable
+ * LIFECYCLE SAFETY: every bus subscription is unsubscribed in the effect cleanup; input listeners are removed on
+ * unmount; the WebGL canvas is torn down by React Three Fiber when this component unmounts.
  */
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
-import Phaser from 'phaser';
-import { api, type GameDto } from '../api';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Link, useLocation, useNavigate } from 'react-router-dom';
+import { api, ApiError, type Cape, type Difficulty, type GameDto, type Rewards, type VerifyResult } from '../api';
 import { TypedEmitter, type GameEvents } from '../events';
-import { DungeonScene, MAPS, TILE } from '../game/DungeonScene';
-import PuzzleModal from '../components/PuzzleModal';
+import { GameEngine } from '../game/engine';
+import { CHAPTERS, generateLevel } from '../game/levels';
+import { InputController } from '../game/input';
+import { attachAudio } from '../audio';
+import { updateSettings, useSettings } from '../settings';
 import { useAuth } from '../auth';
+import GameScene from '../scene/GameScene';
+import { webglAvailable } from '../scene/support';
+import HUD from '../components/HUD';
+import TouchControls from '../components/TouchControls';
+import Dialog from '../components/Dialog';
+import SettingsPanel from '../components/SettingsPanel';
+import BananaChallengeModal from '../components/BananaChallengeModal';
+import { ErrorScreen, LoadingScreen, SceneBoundary } from '../components/Feedback';
+import { SkullIcon, TrophyIcon } from '../components/icons';
 
-type Result = GameDto & { durationMs: number };
-const MAX_HP = 3;
-const LEVELS = MAPS.length; // 3
+type Won = GameDto & { durationMs: number; rewards: Rewards };
+type Screen = 'play' | 'dead' | 'cleared' | 'won';
 
-const fmtTime = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+const DEFAULT_CAPE = '#8a2a2a';
+const fmtDuration = (ms: number) => `${Math.floor(ms / 60000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, '0')}`;
+const chapterName = (level: number) => CHAPTERS[Math.min(level, CHAPTERS.length - 1)]!.name;
 
 export default function Play() {
+  const nav = useNavigate();
+  const location = useLocation();
   const { serverStatus, retryServer } = useAuth();
-  const navigate = useNavigate();
-  const host = useRef<HTMLDivElement>(null);
-  const [game, setGame] = useState<GameDto | null>(null);
-  const [bus] = useState(() => new TypedEmitter<GameEvents>());
-  const [level, setLevel] = useState(0);
-  const [hasKey, setHasKey] = useState(false);
-  const [doorOpen, setDoorOpen] = useState(false);
-  const [hp, setHp] = useState(MAX_HP);
-  const [paused, setPaused] = useState(false);
-  const [puzzleOpen, setPuzzleOpen] = useState(false);
-  const [hint, setHint] = useState('Find the golden key.');
-  const [result, setResult] = useState<Result | null>(null);
-  const [dead, setDead] = useState(false);
-  const [error, setError] = useState('');
-  const [seconds, setSeconds] = useState(0);
-  const [phaserRef, setPhaserRef] = useState<Phaser.Game | null>(null);
-  const [startingGame, setStartingGame] = useState(false);
-  const [animateHeart, setAnimateHeart] = useState(false);
-  const [doorLvl, setDoorLvl] = useState(false); // door unlocked on this level
-  const gameIdRef = useRef<string | null>(null);
+  const { sound } = useSettings();
+  const [initial] = useState(() => {
+    const s = location.state as { mode?: 'new' | 'continue'; difficulty?: Difficulty } | null;
+    return { mode: s?.mode ?? 'continue', difficulty: s?.difficulty ?? 'normal' } as const;
+  });
 
-  // ── Bootstrap: create a new server-side game session ────────────────────
-  // Retryable — if server is offline we show a retry button instead of a broken screen.
-  const startNewGame = useCallback(() => {
-    setStartingGame(true);
-    setError('');
-    api.newGame()
-      .then((g) => { setGame(g); gameIdRef.current = g.id; })
-      .catch(() => setError('Could not reach the game server. Check it is running on port 4000.'))
-      .finally(() => setStartingGame(false));
+  const [bus] = useState(() => new TypedEmitter<GameEvents>());
+  const [game, setGame] = useState<GameDto | null>(null);
+  const [boot, setBoot] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [bootSeq, setBootSeq] = useState(0);
+  const [bootMode, setBootMode] = useState<'new' | 'continue'>(initial.mode);
+  const [bootDifficulty, setBootDifficulty] = useState<Difficulty>(initial.difficulty);
+  const [attempt, setAttempt] = useState(0);            // bumped to rebuild the engine for "retry level"
+  const [capeColor, setCapeColor] = useState(DEFAULT_CAPE);
+
+  const [hp, setHp] = useState(3);
+  const [rev, setRev] = useState(0);                    // bumped when keys/doors change so the HUD re-reads the engine
+  const [prompt, setPrompt] = useState(false);
+  const [notice, setNotice] = useState('');
+  const [hurtKey, setHurtKey] = useState(0);
+  const [paused, setPaused] = useState(false);
+  const [challenge, setChallenge] = useState<number | null>(null);   // index of the door being challenged
+  const [settings, setSettings] = useState(false);
+  const [screen, setScreen] = useState<Screen>('play');
+  const [next, setNext] = useState<{ game: GameDto | null; error: string }>({ game: null, error: '' });
+  const [won, setWon] = useState<Won | null>(null);
+  const [saveError, setSaveError] = useState('');
+  const [seconds, setSeconds] = useState(0);
+  const [lost, setLost] = useState(false);
+
+  const gameRef = useRef<GameDto | null>(null);
+  gameRef.current = game;
+  const engineRef = useRef<GameEngine | null>(null);
+  const keySync = useRef(new Map<number, Promise<boolean>>());
+  const noticeTimer = useRef<number>();
+
+  const flash = useCallback((text: string, ms = 2600) => {
+    setNotice(text);
+    window.clearTimeout(noticeTimer.current);
+    noticeTimer.current = window.setTimeout(() => setNotice(''), ms);
   }, []);
 
-  useEffect(() => { startNewGame(); }, [startNewGame]);
-
-  // ── Mount Phaser when game session is ready ──────────────────────────────
+  // ── Bootstrap: resume the current run, or start a new one ───────────────────────────────
   useEffect(() => {
-    if (!game || !host.current) return;
-    const id = game.id;
-    const map = MAPS[level]!;
+    let alive = true;
+    setBoot('loading');
+    (async () => {
+      try {
+        const existing = bootMode === 'new' ? undefined : await api.currentGame();
+        // Hard is a reward; if the server says it is still locked, fall back to a normal run rather than failing.
+        const g: GameDto = existing ?? await api.newGame(bootDifficulty).catch((e: unknown) =>
+          e instanceof ApiError && e.code === 'hard_locked' ? api.newGame('normal') : Promise.reject(e));
+        if (!alive) return;
+        setGame(g);
+        setBoot('ready');
+        if (location.state) nav('/play', { replace: true, state: null });   // a reload must not start another new run
+        api.stats().then((s) => alive && setCapeColor(s.capes.find((c) => c.id === s.cape)?.color ?? DEFAULT_CAPE)).catch(() => undefined);
+      } catch {
+        if (alive) setBoot('error');
+      }
+    })();
+    return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bootSeq]);
 
-    const phaser = new Phaser.Game({
-      type: Phaser.AUTO,
-      parent: host.current,
-      pixelArt: true,
-      backgroundColor: '#0d0b12',
-      width: map[0]!.length * TILE,
-      height: map.length * TILE,
-      scale: { mode: Phaser.Scale.FIT, autoCenter: Phaser.Scale.CENTER_BOTH },
-      physics: { default: 'arcade', arcade: { gravity: { x: 0, y: 0 } } },
-      scene: new DungeonScene(bus, level),
+  const startNewRun = useCallback((difficulty?: Difficulty) => {
+    setBootMode('new'); setBootDifficulty(difficulty ?? gameRef.current?.difficulty ?? 'normal');
+    setGame(null); setWon(null); setSaveError(''); setBootSeq((n) => n + 1);
+  }, []);
+
+  // ── The engine for the chapter being played. Rebuilt on a new run, a new chapter, or "retry level". ──
+  const engine = useMemo(() => {
+    const g = gameRef.current;
+    if (!g) return null;
+    keySync.current = new Map();
+    return new GameEngine(generateLevel(g.seed, g.level, g.doorsInLevel), bus.emit.bind(bus), {
+      keysCollected: g.keysCollected,
+      doorsOpened: g.doorsOpened,
+      final: g.level >= g.levelCount - 1,
+      maxHp: g.difficulty === 'hard' ? 2 : 3,
     });
-    setPhaserRef(phaser);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [game?.id, game?.level, attempt, bus]);
+  engineRef.current = engine;
+  // Development-only hook so the browser smoke test can observe and drive the engine (stripped from production builds).
+  if (import.meta.env.DEV) (window as unknown as { __engine?: GameEngine | null }).__engine = engine;
 
-    // ── Event subscriptions (producers: DungeonScene / PuzzleModal) ─────
+  const input = useMemo(() => {
+    const c = new InputController({
+      onInteract: () => engineRef.current?.interact(),
+      onPause: () => engineRef.current?.togglePause(),
+    });
+    c.enabled = () => engineRef.current?.phase === 'PLAYING';
+    return c;
+  }, []);
+  useEffect(() => input.attach(), [input]);
+
+  // Reset presentation state whenever a fresh engine takes over.
+  useEffect(() => {
+    if (!engine) return;
+    setHp(engine.hp); setPrompt(false); setPaused(false); setChallenge(null); setScreen('play'); setNotice(''); setRev((n) => n + 1);
+    input.clear();
+  }, [engine, input]);
+
+  useEffect(() => attachAudio(bus), [bus]);
+
+  /** Ask the server to move the run to the next chapter (also the retry action when that call failed). */
+  const advance = useCallback(async () => {
+    const g = gameRef.current;
+    if (!g) return;
+    setNext({ game: null, error: '' });
+    try { setNext({ game: await api.advance(g.id), error: '' }); }
+    catch (e) { setNext({ game: null, error: e instanceof ApiError ? e.message : 'Could not save your progress. Check your connection.' }); }
+  }, []);
+
+  // ── Event subscriptions (consumers of the engine's events) ──────────────────────────────
+  useEffect(() => {
+    if (!engine || !game) return;
+    const id = game.id;
     const off = [
-      /**
-       * key:collected — player walked over the key sprite.
-       * PRODUCER: DungeonScene physics overlap handler
-       * CONSUMER: (1) Update React HUD, (2) persist to server so score can be computed
-       */
-      bus.on('key:collected', () => {
-        setHasKey(true);
-        setHint('Key found! Try the iron door.');
-        void api.collectKey(id);
+      bus.on('key:collected', (i) => {
+        setRev((n) => n + 1);
+        flash('You took a golden key');
+        keySync.current.set(i, api.collectKey(id, i).then(() => true).catch(() => false));   // saved server-side (re-tried before the challenge)
       }),
-
-      /**
-       * player:damaged — player touched a trap or enemy.
-       * PRODUCER: DungeonScene.takeDamage()
-       * CONSUMER: Update HP display, animate hearts
-       */
-      bus.on('player:damaged', (remaining) => {
-        setHp(remaining);
-        setAnimateHeart(true);
-        setTimeout(() => setAnimateHeart(false), 400);
-        if (remaining <= 0) setHint('');
-        else setHint(remaining === 1 ? '⚠️ One heart remaining!' : 'You took damage!');
+      bus.on('player:damaged', (left) => { setHp(left); setHurtKey((n) => n + 1); }),
+      bus.on('interact:available', (t) => setPrompt(t !== null)),
+      bus.on('door:locked', () => flash('The door is sealed. Find its golden key first.')),
+      bus.on('door:touched', (door) => {
+        input.clear();
+        void (async () => {
+          // The server only issues a challenge after it knows this door's key was collected: make sure that write landed.
+          // (Idempotent, so resumed runs whose key the server already holds simply get a 200.) Bounded wait: a hung server
+          // must never leave the hero frozen in CHALLENGE with no dialog on screen.
+          const saved = (keySync.current.get(door) ?? Promise.resolve(false)).then((v) => v || api.collectKey(id, door).then(() => true).catch(() => false));
+          const ok = await Promise.race([saved, new Promise<boolean>((r) => setTimeout(() => r(false), 8000))]);
+          if (!ok) { engine.dismissChallenge(); flash('Could not reach the server. Try the door again.'); return; }
+          setChallenge(door);
+        })();
       }),
-
-      bus.on('door:locked', () => setHint('The door is sealed. Find the key first.')),
-
-      /**
-       * door:touched — player with key reached the door.
-       * PRODUCER: DungeonScene.onDoor()
-       * CONSUMER: Show PuzzleModal to request a Banana API puzzle
-       */
-      bus.on('door:touched', () => {
-        setPuzzleOpen(true);
-        setHint('Solve the rune puzzle to break the seal…');
+      bus.on('door:unlocked', (door) => {
+        setChallenge(null); setRev((n) => n + 1);
+        flash(engine.allOpen ? 'Every seal is broken! Find the portal.' : `Door ${door + 1} opens — on to the next room.`, 3600);
       }),
-
-      /**
-       * door:unlocked — server confirmed correct puzzle answer.
-       * PRODUCER: DungeonScene.unlockDoor() (after React emits puzzle:solved)
-       * CONSUMER: Close puzzle UI, update hint
-       */
-      bus.on('door:unlocked', () => {
-        setDoorOpen(true);
-        setDoorLvl(true);
-        setPuzzleOpen(false);
-        setHint('The seal is broken! Reach the glowing exit!');
-      }),
-
       bus.on('game:paused', () => setPaused(true)),
       bus.on('game:resumed', () => setPaused(false)),
-
-      /**
-       * game:won — player reached the exit tile.
-       * PRODUCER: DungeonScene (exit overlap)
-       * CONSUMER: Call api.complete() to compute and persist server-side score.
-       */
+      bus.on('level:cleared', (lvl) => {
+        if (lvl >= game.levelCount - 1) return;          // final chapter → game:won handles it
+        setScreen('cleared');
+        void advance();
+      }),
       bus.on('game:won', () => {
-        void api.complete(id).then(setResult).catch(() => setError('Score not saved — server error.'));
+        setScreen('won');
+        setSaveError('');
+        void api.complete(id).then(setWon).catch((e) => setSaveError(e instanceof ApiError ? e.message : 'Could not save your score.'));
       }),
-
-      bus.on('game:dead', () => {
-        setDead(true);
-        setHint('');
-      }),
+      bus.on('game:dead', () => setScreen('dead')),
     ];
+    return () => off.forEach((f) => f());
+  }, [engine, game, bus, flash, input, advance]);
 
-    // Cleanup: remove all listeners and destroy Phaser to free WebGL context
-    return () => {
-      off.forEach((f) => f());
-      phaser.destroy(true);
-      setPhaserRef(null);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [game, level]);
-
-  // ── Elapsed timer ────────────────────────────────────────────────────────
+  // ── Timer: the server's wall clock since the run started ───────────────────────────────
   useEffect(() => {
-    if (!game || result || dead) return;
-    const t = setInterval(
-      () => setSeconds(Math.floor((Date.now() - new Date(game.startedAt).getTime()) / 1000)),
-      500,
-    );
+    if (!game || screen === 'won') return;
+    const tick = () => setSeconds(Math.max(0, Math.floor((Date.now() - Date.parse(game.startedAt)) / 1000)));
+    tick();
+    const t = setInterval(tick, 500);
     return () => clearInterval(t);
-  }, [game, result, dead]);
+  }, [game, screen]);
 
-  // ── Restart: re-create game session and reset all state ─────────────────
-  const restart = useCallback(() => {
-    if (phaserRef) { phaserRef.destroy(true); setPhaserRef(null); }
-    setGame(null); setHasKey(false); setDoorOpen(false);
-    setHp(MAX_HP); setPaused(false); setPuzzleOpen(false);
-    setResult(null); setDead(false); setError(''); setSeconds(0);
-    setHint('Find the golden key.'); setLevel(0); setDoorLvl(false);
-    startNewGame();
-  }, [phaserRef, startNewGame]);
+  // ── Housekeeping: no page scroll, auto-pause when the tab is hidden ─────────────────────
+  useEffect(() => {
+    document.documentElement.classList.add('is-playing');
+    const onHide = () => { const e = engineRef.current; if (document.hidden && e?.phase === 'PLAYING') e.togglePause(); };
+    document.addEventListener('visibilitychange', onHide);
+    return () => { document.documentElement.classList.remove('is-playing'); document.removeEventListener('visibilitychange', onHide); window.clearTimeout(noticeTimer.current); };
+  }, []);
 
-  const hearts = Array.from({ length: MAX_HP }, (_, i) => ({
-    full: i < hp,
-    pulse: animateHeart && i === hp,
-  }));
+  // ── Actions ─────────────────────────────────────────────────────────────────────────────
+  const closeChallenge = () => { setChallenge(null); engine?.dismissChallenge(); };
+  const solved = (r: VerifyResult) => {
+    setChallenge(null);
+    bus.emit('puzzle:solved', undefined);
+    // Mirror the server's new progress locally (the engine is NOT rebuilt: it is keyed by game id / chapter only).
+    setGame((g) => g && {
+      ...g,
+      doorsOpened: r.doorsOpened ?? g.doorsOpened + 1,
+      keysCollected: Math.max(g.keysCollected, r.doorsOpened ?? g.doorsOpened + 1),
+      status: r.chapterUnlocked ? 'DOOR_UNLOCKED' : g.status,
+    });
+    engine?.unlockDoor();
+  };
+  const descend = () => { if (next.game) { setGame(next.game); setNext({ game: null, error: '' }); } };
+  const resume = () => engine?.togglePause();
+  const equipNow = async (c: Cape) => { try { await api.setCape(c.id); setCapeColor(c.color); } catch { flash('Could not equip that cape.'); } };
 
-  // ── Render ──────────────────────────────────────────────────────────────
+  // ── Render ──────────────────────────────────────────────────────────────────────────────
+  if (!webglAvailable()) {
+    return <ErrorScreen title="3D graphics unavailable" message="This browser cannot create a WebGL context, which the dungeon needs. Try a current version of Chrome, Edge, Firefox or Safari with hardware acceleration enabled." />;
+  }
+  if (boot === 'error') {
+    return (
+      <ErrorScreen title="The dungeon gates are shut" message="Could not reach the game server. Make sure it is running, then try again."
+        actions={<><button type="button" onClick={() => { retryServer(); setBootSeq((n) => n + 1); }}>Try again</button><Link className="btn ghost" to="/">Back to menu</Link></>} />
+    );
+  }
+  if (boot === 'loading' || !game || !engine) return <LoadingScreen label={bootMode === 'new' ? 'Forging a new dungeon…' : 'Returning to the dungeon…'} />;
+
+  void rev;   // re-render trigger: HUD values below are read straight from the engine
+  const level = engine.level;
+  const hard = game.difficulty === 'hard';
+  const doorLabel = (d: number) => `Chapter ${game.level + 1} · Sealed door ${d + 1} of ${game.doorsInLevel}`;
+  const nextChapter = next.game ? chapterName(next.game.level) : '';
+
   return (
-    <section className="play" aria-label="Dungeon Escape Game">
-      {/* ── HUD ──────────────────────────────────────────────────────── */}
-      <div className="hud" aria-live="polite" aria-label="Game status">
-        <div className="hud-item">
-          <span className="hud-label">Level</span>
-          <span className="level-badge">{level + 1} / {LEVELS}</span>
-        </div>
-        <div className="hud-item">
-          <span className="hud-label">HP</span>
-          <div className="hp-hearts" aria-label={`${hp} of ${MAX_HP} hearts`}>
-            {hearts.map((h, i) => (
-              <span
-                key={i}
-                className={`heart ${h.full ? 'full' : 'empty'} ${h.pulse ? 'pulse' : ''}`}
-                aria-hidden="true"
-              >
-                {h.full ? '♥' : '♡'}
-              </span>
-            ))}
-          </div>
-        </div>
-        <div className="hud-item">
-          <span className="hud-label">Key</span>
-          <span className={`hud-value ${hasKey ? 'good' : ''}`}>{hasKey ? 'Held ✓' : 'Missing'}</span>
-        </div>
-        <div className="hud-item">
-          <span className="hud-label">Door</span>
-          <span className={`hud-value ${doorLvl ? 'good' : ''}`}>{doorLvl ? 'Open ✓' : 'Sealed'}</span>
-        </div>
-        <div className="hud-item hud-timer">
-          <span className="hud-label">Time</span>
-          <span className="hud-value" style={{ fontVariantNumeric: 'tabular-nums' }}>{fmtTime(seconds)}</span>
-        </div>
-        {hint && !paused && (
-          <div className="hud-hint" role="status">{hint}</div>
-        )}
-        {paused && (
-          <div className="hud-hint" role="status" style={{ color: 'var(--amber)' }}>
-            ⏸ Paused — press Esc or Resume to continue
-          </div>
-        )}
-      </div>
+    <section className="play" aria-label="Dungeon Escape game">
+      <SceneBoundary>
+        <GameScene engine={engine} input={input} cape={capeColor} onContextLost={() => setLost(true)} />
+      </SceneBoundary>
+      <div className="vignette" aria-hidden="true" />
+      {hurtKey > 0 && <div key={hurtKey} className="hurt-flash" aria-hidden="true" />}
 
-      {/* ── Canvas ───────────────────────────────────────────────────── */}
-      <div className="stage" ref={host} id="game-canvas-host" aria-label="Game canvas" />
+      <HUD
+        levelName={level.name} level={game.level} levelCount={game.levelCount}
+        hp={hp} maxHp={engine.maxHp} keyHeld={engine.hasKeyForNext}
+        doorsOpen={engine.doorsOpenCount} doorsTotal={level.doors.length}
+        relics={game.relics} hard={hard} seconds={seconds}
+        prompt={prompt && !paused && challenge === null} notice={notice} paused={paused}
+        soundOn={sound} hurtKey={hurtKey}
+        onPause={resume} onToggleSound={() => updateSettings({ sound: !sound })}
+        onInteract={() => engine.interact()}
+      />
+      <TouchControls input={input} canUse={prompt && screen === 'play' && !paused && challenge === null} onInteract={() => engine.interact()} />
 
-      {/* ── Controls hint ────────────────────────────────────────────── */}
-      <div className="controls-hint" aria-label="Keyboard controls">
-        <span><span className="key-icon">↑</span><span className="key-icon">↓</span><span className="key-icon">←</span><span className="key-icon">→</span> or <span className="key-icon">W</span><span className="key-icon">A</span><span className="key-icon">S</span><span className="key-icon">D</span> — Move</span>
-        <span><span className="key-icon">Esc</span> — Pause</span>
-      </div>
-
-      {/* ── Server offline mid-game warning ────────────────────────────── */}
-      {serverStatus === 'offline' && game && (
-        <div role="alert" style={{
-          position: 'fixed', bottom: '1rem', right: '1rem', zIndex: 500,
-          background: 'rgba(127,29,29,.9)', color: '#fef2f2',
-          borderRadius: '10px', padding: '.6rem 1rem',
-          fontSize: '.8rem', display: 'flex', gap: '.75rem', alignItems: 'center',
-          boxShadow: '0 4px 16px rgba(0,0,0,.5)', backdropFilter: 'blur(6px)',
-        }}>
-          <span>⚠️ Server offline — score may not save</span>
-          <button onClick={retryServer} style={{ background: 'rgba(255,255,255,.2)', border: 'none', color: '#fef2f2', borderRadius: '5px', padding: '.2rem .5rem', cursor: 'pointer', fontSize: '.75rem' }}>Retry</button>
-        </div>
+      {serverStatus === 'offline' && (
+        <div className="toast bad" role="alert">Server offline — progress may not save. <button type="button" className="ghost sm" onClick={retryServer}>Retry</button></div>
       )}
 
-      {/* ── Error with retry ──────────────────────────────────────────── */}
-      {error && (
-        <div style={{ textAlign: 'center', padding: '3rem 1rem' }}>
-          <div style={{ fontSize: '3rem', marginBottom: '1rem' }}>🔌</div>
-          <p className="msg bad" role="alert" style={{ marginBottom: '1.5rem' }}>{error}</p>
-          <div style={{ display: 'flex', gap: '1rem', justifyContent: 'center' }}>
-            <button id="play-retry-btn" onClick={startNewGame} disabled={startingGame}>
-              {startingGame ? 'Connecting…' : '↻ Retry'}
-            </button>
-            <Link className="btn ghost" to="/">Home</Link>
-          </div>
-        </div>
-      )}
+      {challenge !== null && <BananaChallengeModal gameId={game.id} levelLabel={doorLabel(challenge)} onSolved={solved} onClose={closeChallenge} />}
 
-      {/* ── Pause overlay ─────────────────────────────────────────────── */}
-      {paused && (
-        <div className="overlay pause-overlay" role="dialog" aria-modal="true" aria-label="Game paused">
-          <div className="card">
+      {paused && !settings && (
+        <Dialog className="menu-overlay" label="Game paused" onClose={resume}>
+          <div className="panel narrow">
             <h2>Paused</h2>
-            <ul className="pause-menu">
-              <li><button id="pause-resume-btn" onClick={() => bus.emit('game:resumed', undefined)}>Resume</button></li>
-              <li><button id="pause-restart-btn" className="ghost" onClick={restart}>Restart</button></li>
-              <li><Link className="btn ghost" to="/dashboard" id="pause-dashboard-btn">Dashboard</Link></li>
-            </ul>
-          </div>
-        </div>
-      )}
-
-      {/* ── Puzzle modal ──────────────────────────────────────────────── */}
-      {puzzleOpen && game && (
-        <PuzzleModal
-          gameId={game.id}
-          onSolved={() => { setPuzzleOpen(false); bus.emit('puzzle:solved', undefined); }}
-          onClose={() => { setPuzzleOpen(false); bus.emit('puzzle:dismissed', undefined); }}
-        />
-      )}
-
-      {/* ── Victory screen ────────────────────────────────────────────── */}
-      {result && !dead && (
-        <div className="overlay" role="dialog" aria-modal="true" aria-label="Victory">
-          <div className="card victory-card" style={{ textAlign: 'center' }}>
-            <h2>⚔️ You Escaped!</h2>
-            <p className="muted" style={{ marginBottom: '.5rem' }}>The dungeon is behind you.</p>
-            <div className="score-display">{result.score?.toLocaleString() ?? '—'}</div>
-            <div className="score-label">Score</div>
-            <div style={{ display: 'flex', gap: '1.5rem', justifyContent: 'center', margin: '1rem 0', fontSize: '.9rem', color: 'var(--ink2)' }}>
-              <span>⏱ {(result.durationMs / 1000).toFixed(1)}s</span>
-              <span>✗ {result.wrongAttempts} wrong</span>
-              <span>📊 Level {level + 1}</span>
-            </div>
-            <div className="row" style={{ justifyContent: 'center' }}>
-              <button id="victory-play-again-btn" onClick={restart}>Play Again</button>
-              <Link className="btn ghost" to="/dashboard" id="victory-dashboard-btn">Dashboard</Link>
+            <p className="muted">
+              {level.name} · door {Math.min(engine.doorsOpenCount + 1, level.doors.length)} of {level.doors.length}{hard ? ' · Hard' : ''}.
+              The clock keeps running — it is measured by the server.
+            </p>
+            <div className="stack-btns">
+              <button type="button" onClick={resume} data-autofocus>Resume</button>
+              <button type="button" className="ghost" onClick={() => setSettings(true)}>Settings</button>
+              <button type="button" className="ghost" onClick={() => startNewRun()}>Restart run</button>
+              <Link className="btn ghost" to="/">Quit to menu</Link>
             </div>
           </div>
-        </div>
+        </Dialog>
+      )}
+      {settings && <SettingsPanel onClose={() => setSettings(false)} />}
+
+      {screen === 'cleared' && (
+        <Dialog className="menu-overlay" label="Chapter cleared" locked>
+          <div className="panel narrow center good">
+            <p className="eyebrow">Relic {game.level + 1} of {game.levelCount} recovered</p>
+            <h2>{level.name} falls silent</h2>
+            <div className="relics big" role="img" aria-label={`${game.level + 1} of ${game.levelCount} relics`}>
+              {Array.from({ length: game.levelCount }, (_, i) => <i key={i} className={i <= game.level ? 'got' : ''} />)}
+            </div>
+            {next.error ? (
+              <>
+                <p className="feedback bad" role="alert">{next.error}</p>
+                <div className="stack-btns">
+                  <button type="button" onClick={() => void advance()} data-autofocus>Try again</button>
+                  <Link className="btn ghost" to="/">Quit to menu</Link>
+                </div>
+              </>
+            ) : next.game ? (
+              <>
+                <p className="muted">Next: {nextChapter} · {next.game.doorsInLevel} sealed doors</p>
+                <button type="button" onClick={descend} data-autofocus>Descend</button>
+              </>
+            ) : <p className="muted" role="status">Saving your progress…</p>}
+          </div>
+        </Dialog>
       )}
 
-      {/* ── Death screen ──────────────────────────────────────────────── */}
-      {dead && (
-        <div className="overlay" role="dialog" aria-modal="true" aria-label="Game over">
-          <div className="card death-card" style={{ textAlign: 'center' }}>
-            <h2>💀 You Perished</h2>
-            <p className="muted" style={{ margin: '.75rem 0' }}>The dungeon claimed another soul.</p>
-            <div className="row" style={{ justifyContent: 'center' }}>
-              <button id="death-retry-btn" onClick={restart}>Try Again</button>
-              <Link className="btn ghost" to="/" id="death-home-btn">Home</Link>
+      {screen === 'dead' && (
+        <Dialog className="menu-overlay danger" label="You died" locked>
+          <div className="panel narrow center bad">
+            <SkullIcon className="big-icon" />
+            <h2>You perished</h2>
+            <p className="muted">The dungeon claimed another soul. Your keys and broken doors are kept.</p>
+            <div className="stack-btns">
+              <button type="button" onClick={() => setAttempt((n) => n + 1)} data-autofocus>Retry chapter</button>
+              <button type="button" className="ghost" onClick={() => startNewRun()}>Restart run</button>
+              <Link className="btn ghost" to="/">Quit to menu</Link>
             </div>
           </div>
-        </div>
+        </Dialog>
+      )}
+
+      {screen === 'won' && (
+        <Dialog className="menu-overlay" label="Victory" locked>
+          <div className="panel center good victory">
+            <TrophyIcon className="big-icon gold" />
+            <h2>You escaped the Oracle's Vault!</h2>
+            {won ? (
+              <>
+                <div className={`rank rank-${won.rewards.rank}`} aria-label={`Rank ${won.rewards.rank}`}>{won.rewards.rank}</div>
+                <div className="score">{won.rewards.score.toLocaleString()}</div>
+                <p className="muted">
+                  score · {fmtDuration(won.durationMs)} · {won.wrongAttempts} wrong answer{won.wrongAttempts === 1 ? '' : 's'} · {won.rewards.relics} relics{hard ? ' · Hard' : ''}
+                </p>
+                {won.rewards.newAchievements.length > 0 && (
+                  <div className="unlocks">
+                    <h3>Achievements unlocked</h3>
+                    <ul>{won.rewards.newAchievements.map((a) => <li key={a.id}><TrophyIcon /><span><strong>{a.title}</strong> {a.description}</span></li>)}</ul>
+                  </div>
+                )}
+                {won.rewards.newCapes.length > 0 && (
+                  <div className="unlocks">
+                    <h3>New cape{won.rewards.newCapes.length === 1 ? '' : 's'}</h3>
+                    <ul>{won.rewards.newCapes.map((c) => (
+                      <li key={c.id}><i className="swatch" style={{ background: c.color }} aria-hidden="true" /><span><strong>{c.name}</strong></span>
+                        <button type="button" className="ghost sm" onClick={() => void equipNow(c)} disabled={capeColor === c.color}>{capeColor === c.color ? 'Equipped' : 'Equip'}</button></li>
+                    ))}</ul>
+                  </div>
+                )}
+              </>
+            ) : saveError ? <p className="feedback bad" role="alert">{saveError}</p> : <p className="muted" role="status">Recording your escape…</p>}
+            <div className="stack-btns">
+              <button type="button" onClick={() => startNewRun(hard ? 'hard' : 'normal')} data-autofocus>Play again — a new dungeon every run</button>
+              {!hard && won && <button type="button" className="ghost" onClick={() => startNewRun('hard')}>Take on Hard mode</button>}
+              <Link className="btn ghost" to="/dashboard">Records, rewards &amp; leaderboard</Link>
+              <Link className="btn ghost" to="/">Menu</Link>
+            </div>
+          </div>
+        </Dialog>
+      )}
+
+      {lost && (
+        <ErrorScreen title="Graphics context lost" message="The browser reclaimed the graphics card. Reload to continue — your progress is saved."
+          actions={<button type="button" onClick={() => window.location.reload()}>Reload</button>} />
       )}
     </section>
   );

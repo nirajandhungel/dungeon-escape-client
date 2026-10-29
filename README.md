@@ -1,70 +1,58 @@
 # Dungeon Escape — Client
 
-React + TypeScript + Phaser 3 browser game with event-driven architecture.
+React 18 + TypeScript + **three.js (React Three Fiber v8)** browser game. Real 3D: procedural geometry, PBR materials, shadows, fog and a follow camera. No external art or sound assets.
 
-## Stack
-- **React 18** — UI and state
-- **Phaser 3** — 2D game engine (canvas / WebGL)
-- **Vite** — dev server + bundler
-- **react-router-dom** — client-side routing
-
-## Setup
+## Run
 
 ```bash
-cp .env.example .env   # no secrets needed for client
-pnpm install
-pnpm run dev           # Vite dev server on http://localhost:5173
+npm install            # or pnpm install
+npm run dev            # Vite on http://localhost:5173 (proxies /api to the server on :4000)
+npm test               # 31 unit tests: engine rules + generated-level solvability (vitest)
+npm run typecheck && npm run build
 ```
 
-> The server must be running on `http://localhost:4000` for API calls to work.
-> The client degrades gracefully when the server is offline — a red banner
-> and retry button appear automatically.
+The API server (`../dungeon-escape-server`) must be running with MongoDB. The client shows a retryable offline screen if it is not.
 
-## Architecture
+## Structure
 
-### Event-Driven Design
-All game state flows through a **typed event bus** (`src/events.ts`):
-
-```
-DungeonScene (Phaser) → bus.emit(event) → React (Play.tsx) → API call → server
-```
-
-Key events:
-| Event | Producer | Consumer |
-|---|---|---|
-| `key:collected` | DungeonScene | Play.tsx → api.collectKey() |
-| `door:touched` | DungeonScene | Play.tsx → open PuzzleModal |
-| `puzzle:solved` | PuzzleModal | DungeonScene → unlockDoor() |
-| `game:won` | DungeonScene | Play.tsx → api.complete() |
-
-### Interoperability — Banana API
-1. Player reaches door → `door:touched` event
-2. React opens `PuzzleModal`
-3. Modal calls `POST /api/v1/games/:id/puzzles` (server fetches from Banana API)
-4. Image served via `/api/v1/puzzle-image` proxy (mixed-content fix)
-5. Player submits answer → `POST /api/v1/puzzles/:id/verify`
-6. Server validates → `{ correct: true }` → `puzzle:solved` event
-7. DungeonScene unlocks door
-
-### Offline / Server Failure UX
-- `useServerHealth` polls `/api/v1/health` every 8 s
-- If offline: red sticky banner + "OFFLINE" nav indicator
-- Protected routes show a full offline gate with retry button
-- Play page shows retryable error instead of broken canvas
-- Mid-game: floating toast if server goes down during gameplay
-
-## Folder Structure
 ```
 src/
-  api.ts           — typed fetch wrapper (single API boundary)
-  auth.tsx         — AuthContext + server status
-  events.ts        — TypedEmitter event bus
-  useServerHealth.ts — health polling hook
-  components/
-    PuzzleModal.tsx        — Banana API puzzle UI
-    ServerOfflineBanner.tsx — offline indicator
+  events.ts          typed event bus — the contract between engine, UI and audio
   game/
-    DungeonScene.ts  — Phaser 3 scene
-  pages/
-    Home.tsx | Auth.tsx | Play.tsx | Dashboard.tsx
+    levels.ts        seeded chapter generator (rooms chained by sealed doors, key per door) + parser
+    engine.ts        authoritative rules: movement, collisions, hazards, door/key state machine
+    input.ts         keyboard + touch → movement vector; ignores keys typed into inputs
+    rng.ts           deterministic PRNG so a run's seed always rebuilds the same dungeon
+    engine.test.ts / levels.test.ts   unit tests, incl. proof every generated chapter is solvable in door order
+  scene/             React Three Fiber: Environment, Actors, Effects, GameScene (camera/lights), assets (procedural textures)
+  components/        HUD, BananaChallengeModal, CapePicker (Armory), Dialog (focus trap), SettingsPanel, TouchControls, Feedback
+  pages/             Home (title screen + 3D backdrop), Play, Dashboard, Auth
+  api.ts             the only HTTP boundary (session cookie, typed DTOs)
+  audio.ts           procedural Web Audio effects, subscribed to the event bus
+  settings.ts        persisted settings: sound, reduced motion, graphics quality
 ```
+
+## Event flow
+
+`keyboard/touch → InputController → GameEngine → typed events → Play.tsx (HUD + server calls) / audio.ts`
+
+| Event | Producer | Consumer |
+|---|---|---|
+| `key:collected(i)` | engine | Play → `POST /games/:id/key {index}` |
+| `door:touched(i)` | engine `interact()` | Play → opens that door's `BananaChallengeModal` |
+| `puzzle:solved` | Play, after the **server** confirmed the answer | engine `unlockDoor()` → `door:unlocked(i)` |
+| `level:cleared` / `game:won` | engine (only when every door is open) | Play → `POST /advance` / `POST /complete` (rewards) |
+| `player:damaged`, `game:dead`, `game:paused/resumed` | engine | HUD, dialogs, audio |
+
+## Banana challenge
+
+A run is 5 chapters with 13 sealed doors; **every door has its own key and its own Banana challenge**. The browser never calls the Banana API. `BananaChallengeModal` asks our server for a puzzle, shows the image from the owner-checked route `/api/v1/puzzles/:id/image`, and submits digits to `/api/v1/puzzles/:id/verify`. The solution never reaches the client. See `../docs/ASSIGNMENT-GUIDE.md` for the full account, test results and limitations.
+
+## Campaign, rewards, replay
+
+Each run has a server-issued seed (different dungeons every run). Finishing awards a rank, relics, achievements and hero capes (equip them in the Armory — the server re-checks). Hard mode unlocks after the first escape.
+
+## Notes
+
+- Controls: WASD/arrows move, `E`/`Enter`/`Space` use, `Esc` pause; on touch devices an on-screen D-pad and **Use** button appear.
+- `window.__engine` exists only in development builds (used by the browser smoke test) and is compiled out of production.

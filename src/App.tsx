@@ -1,41 +1,32 @@
 /**
- * App.tsx — Root component
+ * App.tsx — root component and routing.
  *
- * EVENT-DRIVEN ARCHITECTURE:
- * - AuthProvider wraps everything so server status & user identity are
- *   available to every component via context (reactive to events).
- * - ServerOfflineBanner is a passive consumer of server status — it appears
- *   and disappears automatically as the health-check poll fires.
- * - When server is offline, the app degrades gracefully: navigation still
- *   works, but protected routes show a clear "Server offline" state with retry.
+ * - AuthProvider exposes the player's virtual identity and the server status to every page.
+ * - The 3D game route is lazy-loaded: three.js is only downloaded when someone opens the title screen or plays.
+ * - During play there is NO page chrome: the game owns the whole viewport (see styles `.play`).
  */
-import { BrowserRouter, Link, Navigate, Route, Routes } from 'react-router-dom';
-import type { ReactNode } from 'react';
+import { lazy, Suspense, useEffect, type ReactNode } from 'react';
+import { BrowserRouter, Link, Navigate, Route, Routes, useLocation } from 'react-router-dom';
 import { api } from './api';
 import { AuthProvider, useAuth } from './auth';
 import ServerOfflineBanner from './components/ServerOfflineBanner';
+import { LoadingScreen } from './components/Feedback';
+import { useReducedMotion } from './settings';
 import Home from './pages/Home';
 import Auth from './pages/Auth';
-import Play from './pages/Play';
 import Dashboard from './pages/Dashboard';
 
-/** Full-screen offline gate — shown instead of protected content when server is down */
+const Play = lazy(() => import('./pages/Play'));
+
+/** Shown instead of protected content while the server is unreachable. */
 function OfflineGate() {
   const { retryServer } = useAuth();
   return (
-    <div style={{
-      display: 'flex', flexDirection: 'column', alignItems: 'center',
-      justifyContent: 'center', minHeight: '60vh', gap: '1.5rem',
-      color: 'var(--ink2)', textAlign: 'center', padding: '2rem',
-    }}>
-      <div style={{ fontSize: '4rem' }}>🔌</div>
-      <h2 style={{ color: 'var(--fg)', margin: 0 }}>Server Offline</h2>
-      <p style={{ maxWidth: 400, margin: 0, lineHeight: 1.7 }}>
-        The game server cannot be reached right now. Your progress is safe —
-        check your server is running at <code style={{ color: 'var(--amber)' }}>localhost:4000</code>.
-      </p>
-      <div style={{ display: 'flex', gap: '1rem' }}>
-        <button id="offline-gate-retry-btn" onClick={retryServer}>↻ Retry Connection</button>
+    <div className="loading error-screen" role="alert">
+      <h2>Server offline</h2>
+      <p>The game server cannot be reached right now. Check that it is running on <code>localhost:4000</code>.</p>
+      <div className="row">
+        <button type="button" id="offline-gate-retry-btn" onClick={retryServer}>Retry connection</button>
         <Link className="btn ghost" to="/">Home</Link>
       </div>
     </div>
@@ -44,12 +35,7 @@ function OfflineGate() {
 
 function Protected({ children }: { children: ReactNode }) {
   const { user, loading, serverStatus } = useAuth();
-
-  if (serverStatus === 'checking' || loading) return (
-    <div style={{ display: 'grid', placeItems: 'center', minHeight: '60vh', color: 'var(--muted)' }}>
-      <span>Connecting…</span>
-    </div>
-  );
+  if (serverStatus === 'checking' || loading) return <LoadingScreen label="Connecting to the dungeon…" />;
   if (serverStatus === 'offline') return <OfflineGate />;
   return user ? <>{children}</> : <Navigate to="/login" replace />;
 }
@@ -58,30 +44,20 @@ function Nav() {
   const { user, setUser, serverStatus } = useAuth();
   return (
     <nav aria-label="Main navigation">
-      <Link to="/" className="brand" aria-label="Dungeon Escape — Home">
-        ⚔ Dungeon Escape
-      </Link>
-      {serverStatus === 'offline' && (
-        <span style={{ color: '#f87171', fontSize: '.75rem', fontWeight: 600 }}>
-          ● OFFLINE
-        </span>
-      )}
+      <Link to="/" className="brand" aria-label="Dungeon Escape — Home">Dungeon Escape</Link>
+      {serverStatus === 'offline' && <span className="offline-dot">● OFFLINE</span>}
       {user ? (
         <>
-          <Link to="/play" id="nav-play">Play</Link>
-          <Link to="/dashboard" id="nav-dashboard">Dashboard</Link>
-          <button
-            id="nav-logout"
-            className="ghost"
-            onClick={async () => { await api.logout(); setUser(null); }}
-            aria-label={`Logout ${user.displayName}`}
-          >
-            {user.displayName} · Logout
+          <Link to="/play" id="nav-play" state={{ mode: 'continue' }}>Play</Link>
+          <Link to="/dashboard" id="nav-dashboard">Records</Link>
+          <button type="button" id="nav-logout" className="ghost sm" aria-label={`Log out ${user.displayName}`}
+            onClick={async () => { await api.logout(); setUser(null); }}>
+            {user.displayName} · Log out
           </button>
         </>
       ) : (
         <>
-          <Link to="/login" id="nav-login">Login</Link>
+          <Link to="/login" id="nav-login">Log in</Link>
           <Link to="/register" id="nav-register">Register</Link>
         </>
       )}
@@ -89,13 +65,18 @@ function Nav() {
   );
 }
 
-export default function App() {
+function Shell() {
+  const { pathname } = useLocation();
+  const reduced = useReducedMotion();
+  useEffect(() => { document.documentElement.classList.toggle('reduce-motion', reduced); }, [reduced]);
+  const playing = pathname === '/play';
+  const full = playing || pathname === '/';
   return (
-    <BrowserRouter>
-      <AuthProvider>
-        <ServerOfflineBanner />
-        <Nav />
-        <main>
+    <div className={`app ${playing ? 'route-play' : pathname === '/' ? 'route-home' : 'route-page'}`}>
+      {!playing && <ServerOfflineBanner />}
+      {!playing && <Nav />}
+      <main className={full ? 'full' : 'page'}>
+        <Suspense fallback={<LoadingScreen />}>
           <Routes>
             <Route path="/" element={<Home />} />
             <Route path="/login" element={<Auth mode="login" />} />
@@ -104,7 +85,17 @@ export default function App() {
             <Route path="/dashboard" element={<Protected><Dashboard /></Protected>} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
-        </main>
+        </Suspense>
+      </main>
+    </div>
+  );
+}
+
+export default function App() {
+  return (
+    <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+      <AuthProvider>
+        <Shell />
       </AuthProvider>
     </BrowserRouter>
   );

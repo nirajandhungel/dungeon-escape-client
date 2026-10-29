@@ -23,7 +23,7 @@ export default function Auth({ mode }: { mode: 'login' | 'register' }) {
         ? await api.register(email, name, password)
         : await api.login(email, password);
       setUser(user);
-      nav('/play');
+      nav('/', { replace: true });
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Network error. Is the server running?');
     } finally {
@@ -34,15 +34,13 @@ export default function Auth({ mode }: { mode: 'login' | 'register' }) {
   return (
     <div className="auth-wrap">
       <form className="card auth" onSubmit={submit} aria-label={register ? 'Registration form' : 'Login form'}>
-        <div style={{ textAlign: 'center', marginBottom: '1rem' }}>
-          <div style={{ fontSize: '2.5rem', marginBottom: '.5rem' }}>{register ? '⚔️' : '🗝️'}</div>
-          <h2>{register ? 'Create Your Adventurer' : 'Welcome Back'}</h2>
-          <p className="muted" style={{ marginTop: '.25rem' }}>
-            {register ? 'Your legend begins here.' : 'The dungeon awaits.'}
+        <div className="auth-head">
+          <p className="eyebrow">{register ? 'New adventurer' : 'Welcome back'}</p>
+          <h2>{register ? 'Create your adventurer' : 'Enter the dungeon'}</h2>
+          <p className="muted">
+            {register ? 'Your runs, records and achievements are saved to this account.' : 'Your unfinished run is waiting.'}
           </p>
         </div>
-
-        <hr className="divider" />
 
         <label htmlFor="auth-email">Email
           <input
@@ -96,7 +94,7 @@ export default function Auth({ mode }: { mode: 'login' | 'register' }) {
 
         {error && <p className="msg bad" role="alert" aria-live="assertive">{error}</p>}
 
-        <button type="submit" id="auth-submit-btn" disabled={pending} style={{ width: '100%', padding: '.7rem' }}>
+        <button type="submit" id="auth-submit-btn" className="primary wide" disabled={pending}>
           {pending ? 'Please wait…' : register ? 'Create Adventurer' : 'Enter the Dungeon'}
         </button>
 

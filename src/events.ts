@@ -1,77 +1,57 @@
 /**
- * Typed event bus — event-driven architecture core
+ * Typed event bus — the event-driven core of the client.
  *
- * This module defines the CONTRACT between the Phaser game scene (producer)
- * and the React UI layer (consumer). Neither layer depends on the other's
- * internals — they only share this typed interface and the bus instance.
+ * It is the CONTRACT between the game engine (producer of gameplay events) and the React UI /
+ * audio (consumers). Neither side imports the other's internals; they share only this interface.
  *
- * EVENT TAXONOMY:
+ * EVENT TAXONOMY
+ *   Player action   key:collected · player:step · player:damaged (payload = HP left)
+ *   Interaction     interact:available (payload = what the player can use now, or null)
+ *   Door            door:locked (bumped it without the key) · door:touched (player chose to open it →
+ *                   challenge) · door:unlocked (server validated the Banana answer)
+ *   Challenge       puzzle:solved · puzzle:dismissed — emitted by the UI, consumed by the engine
+ *   Lifecycle       game:paused · game:resumed · level:cleared (payload = level index) · game:won · game:dead
  *
- * Player action events (produced by DungeonScene.update / physics handlers):
- *   key:collected    — player walked over the key sprite
- *   player:damaged   — player touched a trap or enemy, includes remaining HP
- *
- * Door state events (produced by DungeonScene physics collider callbacks):
- *   door:locked      — player touched door without the key
- *   door:touched     — player touched door while holding the key → triggers puzzle
- *   door:unlocked    — puzzle was solved; door is removed from the physics world
- *
- * Puzzle lifecycle events (produced by React PuzzleModal → game scene):
- *   puzzle:solved    — server confirmed the answer is correct
- *   puzzle:dismissed — player closed the puzzle modal without solving it
- *
- * Game lifecycle events (produced by DungeonScene):
- *   game:paused      — ESC pressed while PLAYING or DOOR_UNLOCKED
- *   game:resumed     — ESC pressed while PAUSED
- *   game:won         — player walked into the exit after the door was unlocked
- *   game:dead        — HP reached 0
- *
- * MEMORY MANAGEMENT:
- * on() returns an unsubscribe function. All React consumers call the returned
- * function in their useEffect cleanup, preventing stale listeners and memory leaks.
+ * MEMORY MANAGEMENT: on() returns an unsubscribe function; every consumer calls it in its cleanup.
  */
+/** Index of the door the player can use right now, or null. */
+export type InteractTarget = number | null;
 
 export interface GameEvents {
-  'key:collected':   undefined;
-  'player:damaged':  number;        // remaining HP
-  'door:locked':     undefined;
-  'door:touched':    undefined;     // player reached the door while holding the key
-  'puzzle:solved':   undefined;     // emitted by the UI after SERVER confirmed the answer
+  'key:collected':    number;      // key index (key i opens door i)
+  'player:step':      undefined;
+  'player:damaged':   number;
+  'interact:available': InteractTarget;
+  'door:locked':      undefined;
+  'door:touched':     number;      // door index → opens that door's Banana challenge
+  'door:unlocked':    number;
+  'puzzle:solved':    undefined;
   'puzzle:dismissed': undefined;
-  'door:unlocked':   undefined;
-  'game:paused':     undefined;
-  'game:resumed':    undefined;
-  'game:won':        undefined;
-  'game:dead':       undefined;
+  'game:paused':      undefined;
+  'game:resumed':     undefined;
+  'level:cleared':    number;
+  'game:won':         undefined;
+  'game:dead':        undefined;
 }
 
 type Handler<T> = (payload: T) => void;
 
-/**
- * TypedEmitter — minimal, type-safe publish/subscribe bus.
- *
- * Chosen over the Phaser EventEmitter for the cross-boundary (Phaser ↔ React)
- * communication path to keep the React layer independent from Phaser types.
- * Phaser's own EventEmitter is still used for internal scene events (SHUTDOWN).
- */
+/** Minimal type-safe publish/subscribe. Kept independent of any rendering library on purpose. */
 export class TypedEmitter<E extends object> {
   private handlers = new Map<keyof E, Set<Handler<never>>>();
 
-  /**
-   * Subscribe to an event. Returns an unsubscribe function.
-   * IMPORTANT: call the returned function in useEffect cleanup to prevent leaks.
-   */
+  /** Subscribe; returns the unsubscribe function. */
   on<K extends keyof E>(event: K, fn: Handler<E[K]>): () => void {
     const set = this.handlers.get(event) ?? new Set();
     set.add(fn as Handler<never>);
     this.handlers.set(event, set);
-    return () => set.delete(fn as Handler<never>);
+    return () => { set.delete(fn as Handler<never>); };
   }
 
-  /** Emit an event with its payload to all registered handlers. */
   emit<K extends keyof E>(event: K, payload: E[K]): void {
     this.handlers.get(event)?.forEach((fn) => (fn as Handler<E[K]>)(payload));
   }
 }
 
 export type GameBus = TypedEmitter<GameEvents>;
+export type Emit = <K extends keyof GameEvents>(event: K, payload: GameEvents[K]) => void;
