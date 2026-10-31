@@ -17,8 +17,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import Dialog from './Dialog';
 import { CloseIcon, ClockIcon } from './icons';
-import { api, ApiError, type PuzzleDto, type VerifyResult } from '../api';
-import { sfx } from '../audio';
+import { api, ApiError, type PuzzleDto, type VerifyResult } from '../services/api.service';
+import { sfx } from '../services/audio.service';
 
 interface Props {
   gameId: string;

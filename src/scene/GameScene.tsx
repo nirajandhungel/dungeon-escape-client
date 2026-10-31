@@ -18,7 +18,7 @@ import { Hero, Guards } from './Actors';
 import { Dust } from './Effects';
 import type { GameEngine } from '../game/engine';
 import type { InputController } from '../game/input';
-import { useReducedMotion, useSettings } from '../settings';
+import { useReducedMotion, useSettings } from '../store/settings.store';
 
 export const FOV = 38;
 const ELEVATION = (57 * Math.PI) / 180;

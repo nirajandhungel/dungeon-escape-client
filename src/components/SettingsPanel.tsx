@@ -1,7 +1,7 @@
 import Dialog from './Dialog';
 import { CloseIcon } from './icons';
-import { sfx } from '../audio';
-import { updateSettings, useSettings } from '../settings';
+import { sfx } from '../services/audio.service';
+import { updateSettings, useSettings } from '../store/settings.store';
 
 /** Every control here changes real behaviour (see settings.ts). Changes apply instantly and persist. */
 export default function SettingsPanel({ onClose }: { onClose: () => void }) {

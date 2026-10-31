@@ -7,7 +7,7 @@
  * comes back online the banner disappears automatically (reactive to
  * serverStatus from AuthContext).
  */
-import { useAuth } from '../auth';
+import { useAuth } from '../contexts/AuthContext';
 
 export default function ServerOfflineBanner() {
   const { serverStatus, retryServer } = useAuth();

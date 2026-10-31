@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { generateLevel, parseLevel, type Pt } from './levels';
 import { GameEngine, MAX_HP, INVINCIBLE_S, TRAP_CYCLE_S, trapHeight, trapOffset, PLAYER_SPEED, type Input } from './engine';
-import type { GameEvents } from '../events';
+import type { GameEvents } from '../services/events.service';
 
 /** A tiny hand-built level keeps the physics numbers exact (the generator is covered in levels.test.ts). */
 const MINI = parseLevel(0, 'Mini', [

@@ -1,6 +1,6 @@
 import { useState } from 'react';
-import { api, ApiError, type Stats } from '../api';
-import { sfx } from '../audio';
+import { api, ApiError, type Stats } from '../services/api.service';
+import { sfx } from '../services/audio.service';
 
 /**
  * The Armory: capes are cosmetic REWARDS. The server decides which are unlocked (from achievements) and re-checks on equip,

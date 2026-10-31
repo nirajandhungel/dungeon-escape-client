@@ -15,7 +15,7 @@
  *
  * World units: 1 tile = 1 unit. `player.x/y` are world coordinates (tile centre = tile index + 0.5).
  */
-import type { Emit, InteractTarget } from '../events';
+import type { Emit, InteractTarget } from '../services/events.service';
 import type { LevelData, Pt } from './levels';
 
 export type Phase = 'PLAYING' | 'PAUSED' | 'CHALLENGE' | 'CLEARED' | 'DEAD';
