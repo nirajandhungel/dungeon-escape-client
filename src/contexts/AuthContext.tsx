@@ -6,8 +6,8 @@
  * offline without crashing the whole app.
  */
 import { createContext, useContext, useEffect, useState, type ReactNode } from 'react';
-import { api, type User } from './api';
-import { useServerHealth, type ServerStatus } from './useServerHealth';
+import { api, type User } from '../services/api.service';
+import { useServerHealth, type ServerStatus } from '../hooks/useServerHealth';
 
 interface Ctx {
   user: User | null;
