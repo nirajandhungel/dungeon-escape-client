@@ -5,8 +5,8 @@
  * sound. The AudioContext is created lazily on the first call after a user gesture (browser autoplay
  * policy) and every call is a no-op when sound is switched off in settings.
  */
-import type { GameBus } from './events';
-import { getSettings } from './settings';
+import type { GameBus } from './events.service';
+import { getSettings } from '../store/settings.store';
 
 let ctx: AudioContext | null = null;
 const audio = () => {
