@@ -8,8 +8,8 @@
  */
 import { lazy, Suspense, useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { api, type Difficulty, type GameDto, type Stats } from '../api';
-import { useAuth } from '../auth';
+import { api, type Difficulty, type GameDto, type Stats } from '../services/api.service';
+import { useAuth } from '../contexts/AuthContext';
 import Dialog from '../components/Dialog';
 import SettingsPanel from '../components/SettingsPanel';
 import { CloseIcon, GearIcon, KeyIcon, TrophyIcon } from '../components/icons';

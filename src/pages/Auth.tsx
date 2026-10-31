@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { api, ApiError } from '../api';
-import { useAuth } from '../auth';
+import { api, ApiError } from '../services/api.service';
+import { useAuth } from '../contexts/AuthContext';
 
 export default function Auth({ mode }: { mode: 'login' | 'register' }) {
   const { setUser } = useAuth();

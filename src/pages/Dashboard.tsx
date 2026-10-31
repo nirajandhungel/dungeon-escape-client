@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { useAuth } from '../auth';
-import { api, type GameDto, type Row, type Stats } from '../api';
+import { useAuth } from '../contexts/AuthContext';
+import { api, type GameDto, type Row, type Stats } from '../services/api.service';
 import { CHAPTERS } from '../game/levels';
 import { TrophyIcon } from '../components/icons';
 import CapePicker from '../components/CapePicker';

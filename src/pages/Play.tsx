@@ -21,14 +21,14 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
-import { api, ApiError, type Cape, type Difficulty, type GameDto, type Rewards, type VerifyResult } from '../api';
-import { TypedEmitter, type GameEvents } from '../events';
+import { api, ApiError, type Cape, type Difficulty, type GameDto, type Rewards, type VerifyResult } from '../services/api.service';
+import { TypedEmitter, type GameEvents } from '../services/events.service';
 import { GameEngine } from '../game/engine';
 import { CHAPTERS, generateLevel } from '../game/levels';
 import { InputController } from '../game/input';
-import { attachAudio } from '../audio';
-import { updateSettings, useSettings } from '../settings';
-import { useAuth } from '../auth';
+import { attachAudio } from '../services/audio.service';
+import { updateSettings, useSettings } from '../store/settings.store';
+import { useAuth } from '../contexts/AuthContext';
 import GameScene from '../scene/GameScene';
 import { webglAvailable } from '../scene/support';
 import HUD from '../components/HUD';

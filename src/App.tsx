@@ -7,11 +7,11 @@
  */
 import { lazy, Suspense, useEffect, type ReactNode } from 'react';
 import { BrowserRouter, Link, Navigate, Route, Routes, useLocation } from 'react-router-dom';
-import { api } from './api';
-import { AuthProvider, useAuth } from './auth';
+import { api } from './services/api.service';
+import { AuthProvider, useAuth } from './contexts/AuthContext';
 import ServerOfflineBanner from './components/ServerOfflineBanner';
 import { LoadingScreen } from './components/Feedback';
-import { useReducedMotion } from './settings';
+import { useReducedMotion } from './store/settings.store';
 import Home from './pages/Home';
 import Auth from './pages/Auth';
 import Dashboard from './pages/Dashboard';
